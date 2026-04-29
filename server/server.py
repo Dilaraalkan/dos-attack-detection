@@ -1,21 +1,29 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS # Dış erişim ve dashboard iletişimi için
 import time
 import os
 import sys
 
-# analysis klasörünü ekle
+# 1. Klasör Yolunu Ayarla: server/analysis içindeki modülleri bulabilmesi için
 sys.path.append(os.path.join(os.path.dirname(__file__), "analysis"))
 
-from analyze import analyze_logs, classify_attack, analyze_file_logs
+try:
+    from analyze import analyze_logs, classify_attack, analyze_file_logs
+except ImportError:
+    print("HATA: analyze.py modülü bulunamadı. Klasör yapısını kontrol edin.")
 
 app = Flask(__name__)
+CORS(app) # Tarayıcıdan gelen isteklere izin ver
 
 logs = []
 
-
-#  TÜM ENDPOINTLERDEN LOG AL 
+# 2. Log Kayıt Fonksiyonu
 @app.before_request
 def log_request():
+    # Dashboard'un kendi veri çekme isteklerini loglama (sonsuz döngüyü önler)
+    if request.path in ['/detect', '/stats', '/favicon.ico'] or request.path.startswith('/static'):
+        return
+
     ip = request.headers.get('X-Forwarded-For', request.remote_addr)
 
     log_entry = {
@@ -27,55 +35,65 @@ def log_request():
 
     logs.append(log_entry)
 
-    # DOSYAYA YAZ
-    with open("traffic.log", "a") as f:
-        f.write(f"{ip},{log_entry['time']},{log_entry['path']}\n")
+    # DOSYAYA YAZ (server/traffic.log)
+    try:
+        with open("traffic.log", "a") as f:
+            f.write(f"{ip},{log_entry['time']},{log_entry['path']}\n")
+    except Exception as e:
+        print(f"Dosya yazma hatası: {e}")
 
-
+# 3. Dashboard Ana Sayfası
 @app.route('/')
 def home():
-    return "Server running"
+    # server/templates/index.html dosyasını döndürür
+    return render_template("index.html")
 
-
+# 4. Analiz ve Tespit Endpoint'i
 @app.route('/detect')
 def detect():
     current_time = time.time()
-
-    # son 30 saniye analiz
-    recent_logs = [log for log in logs if current_time - log["time"] < 30]
+    # Son 30 saniyelik veriyi analiz et
+    recent_logs = [log for log in logs if current_time - log["time"] < 120]
 
     counter = analyze_logs(recent_logs)
     result = classify_attack(counter, recent_logs)
 
-    # GERÇEK ZAMANLI UYARI
     if result.get("attack"):
-        print(" ATTACK DETECTED:", result)
+        print(f" SALDIRI TESPİTİ: {result.get('types')}")
 
     return jsonify(result)
 
-
-#  İSTATİSTİK
+# 5. Dashboard İstatistikleri
 @app.route('/stats')
 def stats():
+    current_time = time.time()
+    recent_logs_count = len([log for log in logs if current_time - log["time"] < 120])
+    
     return jsonify({
         "total_logs": len(logs),
-        "recent_logs": len([log for log in logs if time.time() - log["time"] < 30]),
+        "recent_logs": recent_logs_count,
         "unique_ips": len(set([log["ip"] for log in logs]))
     })
 
-
-#  DOSYADAN ANALİZ
+# 6. Log Dosyasından Analiz
 @app.route('/analyze_file')
 def analyze_file():
-    result = analyze_file_logs("traffic.log")
-    return jsonify(result)
+    if os.path.exists("traffic.log"):
+        result = analyze_file_logs("traffic.log")
+        return jsonify(result)
+    return jsonify({"error": "Log dosyası bulunamadı."}), 404
 
-
+# 7. Sistemi Sıfırla
 @app.route('/reset')
 def reset():
-    logs.clear()
-    return {"status": "cleared"}
-
+    global logs
+    logs = []
+    return jsonify({"status": "Bellek temizlendi"})
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Flask sunucusunu başlat
+    print("--------------------------------------")
+    print(" IDS Sunucusu Aktif")
+    print(" Dashboard: http://127.0.0.1:5000")
+    print("--------------------------------------")
+    app.run(debug=True, port=5000)
