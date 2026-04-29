@@ -6,23 +6,34 @@ import sys
 # analysis klasörünü ekle
 sys.path.append(os.path.join(os.path.dirname(__file__), "analysis"))
 
-from analyze import analyze_logs, classify_attack
+from analyze import analyze_logs, classify_attack, analyze_file_logs
 
 app = Flask(__name__)
 
 logs = []
 
 
-@app.route('/')
-def home():
-    # ✅ SADECE BURADA OLMALI
+#  TÜM ENDPOINTLERDEN LOG AL 
+@app.before_request
+def log_request():
     ip = request.headers.get('X-Forwarded-For', request.remote_addr)
 
-    logs.append({
+    log_entry = {
         "ip": ip,
-        "time": time.time()
-    })
+        "time": time.time(),
+        "path": request.path,
+        "agent": request.headers.get("User-Agent", "unknown")
+    }
 
+    logs.append(log_entry)
+
+    # DOSYAYA YAZ
+    with open("traffic.log", "a") as f:
+        f.write(f"{ip},{log_entry['time']},{log_entry['path']}\n")
+
+
+@app.route('/')
+def home():
     return "Server running"
 
 
@@ -30,11 +41,33 @@ def home():
 def detect():
     current_time = time.time()
 
-    recent_logs = [log for log in logs if current_time - log["time"] < 10]
+    # son 30 saniye analiz
+    recent_logs = [log for log in logs if current_time - log["time"] < 30]
 
     counter = analyze_logs(recent_logs)
     result = classify_attack(counter, recent_logs)
 
+    # GERÇEK ZAMANLI UYARI
+    if result.get("attack"):
+        print(" ATTACK DETECTED:", result)
+
+    return jsonify(result)
+
+
+#  İSTATİSTİK
+@app.route('/stats')
+def stats():
+    return jsonify({
+        "total_logs": len(logs),
+        "recent_logs": len([log for log in logs if time.time() - log["time"] < 30]),
+        "unique_ips": len(set([log["ip"] for log in logs]))
+    })
+
+
+#  DOSYADAN ANALİZ
+@app.route('/analyze_file')
+def analyze_file():
+    result = analyze_file_logs("traffic.log")
     return jsonify(result)
 
 
