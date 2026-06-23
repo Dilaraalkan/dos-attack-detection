@@ -7,22 +7,30 @@ def analyze_logs(logs):
 
 
 def classify_attack(counter, logs, threshold=20):
+
     if not logs:
-        return {"attack": False, "types": ["No Data"]}
+        return {
+            "attack": False,
+            "types": ["No Data"]
+        }
 
     total_requests = len(logs)
+
     unique_ips = len(counter)
 
     times = sorted([log["time"] for log in logs])
+
     duration = max(times) - min(times) if len(times) > 1 else 1
+
     request_rate = total_requests / duration if duration > 0 else total_requests
 
-    from collections import Counter
     paths = [log.get("path", "/") for log in logs]
     path_counts = Counter(paths)
+
     most_targeted = max(path_counts, key=path_counts.get)
 
     agents = [log.get("agent", "unknown") for log in logs]
+
     unique_agents = len(set(agents))
 
     attackers = [ip for ip, count in counter.items() if count > threshold]
@@ -30,27 +38,22 @@ def classify_attack(counter, logs, threshold=20):
     attack_types = []
 
     if attackers:
-        # brute force
+
         if "login" in most_targeted:
             attack_types.append("Brute Force Attack")
 
-        # api abuse
         if "/api" in most_targeted:
             attack_types.append("API Abuse Attack")
 
-        # bot
         if unique_agents < 2:
             attack_types.append("Bot Attack")
 
-        # slow
         if request_rate < 10:
             attack_types.append("Slow DoS")
 
-        #  dos
         if unique_ips == 1:
             attack_types.append("DoS")
 
-        # ddos
         if unique_ips > 5 and request_rate > 100:
             attack_types.append("DDoS Flood")
 
@@ -61,18 +64,25 @@ def classify_attack(counter, logs, threshold=20):
             "attack": True,
             "types": attack_types,
             "rate": round(request_rate, 2),
-            "unique_ips": unique_ips
+            "unique_ips": unique_ips,
+            "attackers": attackers
         }
 
-    return {"attack": False, "types": ["Normal Traffic"]}
+    return {
+        "attack": False,
+        "types": ["Normal Traffic"]
+    }
+
+
 def analyze_file_logs(filename):
-    from collections import Counter
 
     try:
+
         with open(filename, "r") as f:
             lines = f.readlines()
 
         ips = [line.split(",")[0] for line in lines]
+
         counter = Counter(ips)
 
         return {
@@ -82,4 +92,6 @@ def analyze_file_logs(filename):
         }
 
     except FileNotFoundError:
-        return {"error": "Log file not found"}
+        return {
+            "error": "Log file not found"
+        }

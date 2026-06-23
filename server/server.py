@@ -1,30 +1,55 @@
 from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS # Dış erişim ve dashboard iletişimi için
+from flask_cors import CORS
 import time
 import os
 import sys
+import sqlite3
 
-# 1. Klasör Yolunu Ayarla: server/analysis içindeki modülleri bulabilmesi için
-sys.path.append(os.path.join(os.path.dirname(__file__), "analysis"))
+sys.path.append(
+    os.path.join(os.path.dirname(__file__), "analysis")
+)
 
-try:
-    from analyze import analyze_logs, classify_attack, analyze_file_logs
-except ImportError:
-    print("HATA: analyze.py modülü bulunamadı. Klasör yapısını kontrol edin.")
+from analyze import analyze_logs, classify_attack, analyze_file_logs
 
 app = Flask(__name__)
-CORS(app) # Tarayıcıdan gelen isteklere izin ver
+CORS(app)
 
 logs = []
+blocked_ips = set()
 
-# 2. Log Kayıt Fonksiyonu
+# ===============================
+# DATABASE
+# ===============================
+def init_db():
+    conn = sqlite3.connect("ids.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS attack_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attack_time TEXT,
+        attack_type TEXT,
+        attacker_ip TEXT,
+        request_rate REAL,
+        unique_ips INTEGER
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ===============================
+# LOGGING
+# ===============================
 @app.before_request
 def log_request():
-    # Dashboard'un kendi veri çekme isteklerini loglama (sonsuz döngüyü önler)
-    if request.path in ['/detect', '/stats', '/favicon.ico'] or request.path.startswith('/static'):
+    if request.path in ['/detect', '/stats', '/history', '/favicon.ico', '/reset', '/analyze_file']:
         return
 
     ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+
+    if ip in blocked_ips:
+        return jsonify({"error": "IP Blocked"}), 403
 
     log_entry = {
         "ip": ip,
@@ -32,68 +57,148 @@ def log_request():
         "path": request.path,
         "agent": request.headers.get("User-Agent", "unknown")
     }
-
     logs.append(log_entry)
 
-    # DOSYAYA YAZ (server/traffic.log)
     try:
         with open("traffic.log", "a") as f:
             f.write(f"{ip},{log_entry['time']},{log_entry['path']}\n")
     except Exception as e:
-        print(f"Dosya yazma hatası: {e}")
+        print("Log yazma hatası:", e)
 
-# 3. Dashboard Ana Sayfası
+# ===============================
+# DASHBOARD
+# ===============================
 @app.route('/')
 def home():
-    # server/templates/index.html dosyasını döndürür
     return render_template("index.html")
 
-# 4. Analiz ve Tespit Endpoint'i
+# ===============================
+# ATTACK DETECTION
+# ===============================
 @app.route('/detect')
 def detect():
     current_time = time.time()
-    # Son 30 saniyelik veriyi analiz et
     recent_logs = [log for log in logs if current_time - log["time"] < 120]
 
     counter = analyze_logs(recent_logs)
     result = classify_attack(counter, recent_logs)
 
+    if "types" not in result:
+        result["types"] = []
+    elif isinstance(result["types"], str):
+        result["types"] = [result["types"]]
+
     if result.get("attack"):
-        print(f" SALDIRI TESPİTİ: {result.get('types')}")
+        attackers = result.get("attackers", [])
+        for ip in attackers:
+            blocked_ips.add(ip)
+
+        conn = sqlite3.connect("ids.db")
+        cursor = conn.cursor()
+
+        for attack_type in result["types"]:
+            for ip in attackers:
+                cursor.execute("""
+                INSERT INTO attack_history (attack_time, attack_type, attacker_ip, request_rate, unique_ips)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                    attack_type,
+                    ip,
+                    result.get("rate", 0),
+                    result.get("unique_ips", 0)
+                ))
+        conn.commit()
+        conn.close()
 
     return jsonify(result)
 
-# 5. Dashboard İstatistikleri
+# ===============================
+# STATS
+# ===============================
 @app.route('/stats')
 def stats():
     current_time = time.time()
-    recent_logs_count = len([log for log in logs if current_time - log["time"] < 120])
-    
+    recent_logs = [log for log in logs if current_time - log["time"] < 120]
+
+    counter = analyze_logs(recent_logs)
+    top_ip = None
+    if counter:
+        top_ip = counter.most_common(1)[0]
+
     return jsonify({
         "total_logs": len(logs),
-        "recent_logs": recent_logs_count,
-        "unique_ips": len(set([log["ip"] for log in logs]))
+        "recent_logs": len(recent_logs),
+        "unique_ips": len(set([log["ip"] for log in logs])),
+        "blocked_ips": len(blocked_ips),
+        "top_ip": top_ip
     })
 
-# 6. Log Dosyasından Analiz
+# ===============================
+# DATABASE HISTORY (Tam Zaman Dönüşümlü Filtre)
+# ===============================
+@app.route('/history')
+def history():
+    start_param = request.args.get('start')
+    end_param = request.args.get('end')
+
+    conn = sqlite3.connect("ids.db")
+    cursor = conn.cursor()
+
+    query = "SELECT attack_time, attack_type, attacker_ip, request_rate, unique_ips FROM attack_history"
+    conditions = []
+    params = []
+
+    # SQLite strftime fonksiyonu ile veritabanındaki boşluklu veriyi ve query'deki T'li veriyi normalize edip karşılaştırıyoruz
+    if start_param:
+        conditions.append("strftime('%Y-%m-%d %H:%M:%S', attack_time) >= strftime('%Y-%m-%d %H:%M:%S', ?)")
+        params.append(start_param)
+    if end_param:
+        conditions.append("strftime('%Y-%m-%d %H:%M:%S', attack_time) <= strftime('%Y-%m-%d %H:%M:%S', ?)")
+        params.append(end_param)
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    query += " ORDER BY id DESC LIMIT 50"
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    history_data = []
+    for row in rows:
+        history_data.append({
+            "time": row[0],
+            "type": row[1],
+            "ip": row[2],
+            "rate": row[3],
+            "unique_ips": row[4]
+        })
+
+    return jsonify(history_data)
+
+# ===============================
+# FILE ANALYSIS & RESET & START
+# ===============================
 @app.route('/analyze_file')
 def analyze_file():
     if os.path.exists("traffic.log"):
-        result = analyze_file_logs("traffic.log")
-        return jsonify(result)
-    return jsonify({"error": "Log dosyası bulunamadı."}), 404
+        return jsonify(analyze_file_logs("traffic.log"))
+    return jsonify({"error": "Log file not found"})
 
-# 7. Sistemi Sıfırla
 @app.route('/reset')
 def reset():
-    global logs
+    global logs, blocked_ips
     logs = []
-    return jsonify({"status": "Bellek temizlendi"})
+    blocked_ips = set()
+    conn = sqlite3.connect("ids.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM attack_history")
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "System Reset"})
 
 if __name__ == '__main__':
-    # Flask sunucusunu başlat
-    print("--------------------------------------")
-    print(" IDS Sunucusu Aktif")
-    print(" Dashboard: http://127.0.0.1:5000")
-    print("--------------------------------------")
     app.run(debug=True, port=5000)
